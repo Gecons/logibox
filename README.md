@@ -10,14 +10,14 @@ load your workspace.
 
 ## Download
 
-Grab the latest build from this repository.
+Grab the latest build from [Releases Page](https://github.com/Gecons/logibox/releases).
 Extract the zip anywhere, then double-click `LogiBox.exe`.
 
 Windows may show a SmartScreen warning the first time
 ("Windows protected your PC"). Click **More info** → **Run anyway**.
 This happens for any unsigned executable and is not specific to LogiBox.
 This is an open-source project. Feel free to check the source code
-in `logibox.py` which is shared in the repository.
+in `logibox.py` which is shared in the [Repository Page](https://github.com/Gecons/logibox).
 
 ## Commands
 
