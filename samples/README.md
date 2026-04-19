@@ -15,3 +15,5 @@ the specified load command for the sample to load it.
 - **alu16.txt** | 16-bit ALU with 8 operations (ADD, SUB, AND, OR, XOR, NOT, SHL, SHR),
 zero/negative/carry/overflow flags, and a three-bit opcode selector. 209 variables total.
 Load command: `load alu16`
+
+<sub>*More samples will be added in future*</sub>
