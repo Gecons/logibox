@@ -11,6 +11,7 @@ A two-pane terminal UI:
 import curses
 import os
 import re
+import subprocess
 import sys
 from collections import namedtuple
 
@@ -46,11 +47,10 @@ class LogicEngine:
     """
 
     def __init__(self):
-        self.variables = {}          # name -> AST
-        self.sources = {}            # name -> pretty-printed source
-        self._evaluating = set()     # cycle guard during lookup
+        self.variables = {}
+        self.sources = {}
+        self._evaluating = set()
 
-    # == ENTRY POINT ==
     def evaluate(self, source):
         tokens = self.tokenize(source)
         if len(tokens) == 1:
@@ -78,12 +78,9 @@ class LogicEngine:
         return self._eval(("VAR", name))
 
     def export(self):
-        """Return a list of 'name = expression' lines for all bindings."""
         return [f"{name} = {self.sources[name]}" for name in self.variables]
 
     def import_state(self, lines):
-        """Replace all state from a list of assignment strings.
-        If any line is invalid, current state is left untouched."""
         fresh = LogicEngine()
         for i, line in enumerate(lines, 1):
             line = line.strip()
@@ -98,7 +95,6 @@ class LogicEngine:
         self.variables = fresh.variables
         self.sources = fresh.sources
 
-    # == CYCLE CHECK ==
     def _creates_cycle(self, name, node):
         seen = set()
 
@@ -122,7 +118,6 @@ class LogicEngine:
 
         return walk(node)
 
-    # == TOKENIZE ==
     def tokenize(self, source):
         tokens = []
         i, n = 0, len(source)
@@ -162,15 +157,13 @@ class LogicEngine:
         tokens.append(Token("EOF", None))
         return tokens
 
-    # == PARSE ==
-    # Grammar, lowest to highest precedence:
+    # Grammar (lowest to highest precedence):
     #   statement   := IDENT '=' expression | expression
     #   imply_expr  := or_expr   (('IMPLY'|'NIMPLY')         or_expr)*
     #   or_expr     := and_expr  (('OR'|'NOR'|'XOR'|'XNOR')  and_expr)*
     #   and_expr    := not_expr  (('AND'|'NAND')             not_expr)*
     #   not_expr    := primary ('*')*
     #   primary     := LIT | IDENT | '(' expression ')'
-    # Binary ops are left-associative.
     def parse(self, tokens):
         self._tokens = tokens
         self._pos = 0
@@ -243,7 +236,6 @@ class LogicEngine:
             f"unexpected {tok.type} ({tok.value!r}); expected value, variable, or '('"
         )
 
-    # == EXECUTE ==
     def _eval(self, node):
         tag = node[0]
 
@@ -270,7 +262,6 @@ class LogicEngine:
 
         raise RuntimeError(f"unknown AST node: {tag}")
 
-    # == AST -> SOURCE ==
     def _stringify(self, node):
         tag = node[0]
         if tag == "LIT": return str(node[1])
@@ -287,6 +278,42 @@ class LogicEngine:
 
 # == CONSOLE WINDOW ==
 SAVE_NAME_RE = re.compile(r"^[A-Za-z0-9_\-]+$")
+PREFIX_RE    = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+BITS_RE      = re.compile(r"^[01]+$")
+
+WRAP_INDENT = "  "  # 2-space prefix for continuation rows
+
+# Ctrl-key codes differ between Windows (windows-curses) and Unix (ncurses).
+# Windows: regular Backspace = 8, Ctrl+Backspace = 127, Ctrl+(Left/Right) = 443/444
+# Unix:    regular Backspace = 127, Ctrl+Backspace = 8, Ctrl+(Left/Right) = 545/560
+if sys.platform == "win32":
+    CTRL_LEFT_CODES       = {443}
+    CTRL_RIGHT_CODES      = {444}
+    CTRL_BACKSPACE_CODES  = {127}
+    REGULAR_BS_EXTRA      = {8}
+else:
+    CTRL_LEFT_CODES       = {545}
+    CTRL_RIGHT_CODES      = {560}
+    CTRL_BACKSPACE_CODES  = {8}
+    REGULAR_BS_EXTRA      = {127}
+
+
+def wrap_line(line, width):
+    """Wrap a logical line into visual rows.
+    First row has no extra indent; continuation rows are prefixed with
+    WRAP_INDENT. The indent is dropped on very narrow windows where it
+    would leave almost no room for actual content per row."""
+    if width <= 0 or len(line) <= width:
+        return [line]
+    rows = [line[:width]]
+    # Use the indent only when at least 2 chars of content fit after it.
+    indent = WRAP_INDENT if width >= len(WRAP_INDENT) + 2 else ""
+    cont_width = max(1, width - len(indent))
+    i = width
+    while i < len(line):
+        rows.append(indent + line[i:i + cont_width])
+        i += cont_width
+    return rows
 
 
 class LogiBox:
@@ -294,16 +321,18 @@ class LogiBox:
         self.stdscr = stdscr
         self.workspace_lines = []   # everything shown in the top pane
         self.command_buffer = ""    # what the user is currently typing
+        self.cursor_pos = 0         # cursor index within command_buffer
+        self.cmd_view_offset = 0    # horizontal scroll for long input lines
         self.history = []           # previous commands (for up/down arrows)
         self.history_index = None
-        self.scroll_offset = 0      # how many lines scrolled up from bottom
+        self.scroll_offset = 0      # how many visual rows scrolled up from bottom
         self.running = True
 
         self.engine = LogicEngine()
 
         curses.curs_set(1)
         curses.mousemask(curses.ALL_MOUSE_EVENTS)
-        curses.mouseinterval(0)  # don't wait for click-release detection
+        curses.mouseinterval(0)
         self.stdscr.clear()
 
         self._build_layout()
@@ -312,11 +341,11 @@ class LogiBox:
     # == LAYOUT ==
     def _build_layout(self):
         self.height, self.width = self.stdscr.getmaxyx()
-        self.workspace_height = self.height - 3  # command pane uses bottom 3 rows
+        self.workspace_height = self.height - 3
 
         self.workspace_win = curses.newwin(self.workspace_height, self.width, 0, 0)
         self.command_win = curses.newwin(3, self.width, self.workspace_height, 0)
-        self.command_win.keypad(True)  # enables arrow keys, backspace, etc.
+        self.command_win.keypad(True)
 
     def _welcome(self):
         self.log("===     LogiBox by Gecons     ===")
@@ -337,23 +366,35 @@ class LogiBox:
         self.draw_workspace()
 
     # == DRAWING ==
+    def _wrap_width(self):
+        """Column budget for a single row of workspace text."""
+        return max(1, self.width - 4)
+
     def draw_workspace(self):
         self.workspace_win.erase()
         self.workspace_win.border()
         self.workspace_win.addstr(0, 2, " Workspace ")
 
         inner_h = self.workspace_height - 2
-        total = len(self.workspace_lines)
+        wrap_w = self._wrap_width()
+
+        # Flatten logical lines into visual rows. This happens every draw so
+        # the layout always matches the current window width.
+        visual_rows = []
+        for line in self.workspace_lines:
+            visual_rows.extend(wrap_line(line, wrap_w))
+
+        total = len(visual_rows)
         max_offset = max(0, total - inner_h)
         self.scroll_offset = max(0, min(self.scroll_offset, max_offset))
 
         end = total - self.scroll_offset
         start = max(0, end - inner_h)
-        visible = self.workspace_lines[start:end]
+        visible = visual_rows[start:end]
 
-        for i, line in enumerate(visible):
+        for i, row in enumerate(visible):
             try:
-                self.workspace_win.addstr(i + 1, 2, line[: self.width - 4])
+                self.workspace_win.addstr(i + 1, 2, row[: self.width - 4])
             except curses.error:
                 pass
 
@@ -376,9 +417,33 @@ class LogiBox:
     def draw_command_line(self):
         self.command_win.erase()
         self.command_win.border()
-        self.command_win.addstr(0, 2, " Command ")
         try:
-            self.command_win.addstr(1, 2, "> " + self.command_buffer)
+            self.command_win.addstr(0, 2, " Command ")
+        except curses.error:
+            pass
+
+        # prompt + horizontal scroll so the cursor is always visible
+        prompt = "> "
+        inner_width = max(1, self.width - 4)
+        visible_text_width = max(1, inner_width - len(prompt))
+
+        if self.cursor_pos < self.cmd_view_offset:
+            self.cmd_view_offset = self.cursor_pos
+        elif self.cursor_pos - self.cmd_view_offset >= visible_text_width:
+            self.cmd_view_offset = self.cursor_pos - visible_text_width + 1
+
+        slice_start = self.cmd_view_offset
+        slice_end = slice_start + visible_text_width
+        display = self.command_buffer[slice_start:slice_end]
+
+        try:
+            self.command_win.addstr(1, 2, prompt + display)
+        except curses.error:
+            pass
+
+        cursor_col = 2 + len(prompt) + (self.cursor_pos - self.cmd_view_offset)
+        try:
+            self.command_win.move(1, cursor_col)
         except curses.error:
             pass
         self.command_win.refresh()
@@ -387,10 +452,71 @@ class LogiBox:
     def log(self, text=""):
         """Append a line to the workspace pane."""
         self.workspace_lines.append(text)
-        # if user has scrolled up, keep their view anchored by nudging the offset
+        # If the user is scrolled up, keep their view anchored by advancing
+        # the offset past however many visual rows this new line produces.
         if self.scroll_offset > 0:
-            self.scroll_offset += 1
+            self.scroll_offset += len(wrap_line(text, self._wrap_width()))
         self.draw_workspace()
+
+    # == INPUT EDITING ==
+    def _is_word_char(self, c):
+        return c.isalnum() or c == "_"
+
+    def _word_left(self):
+        buf = self.command_buffer
+        i = self.cursor_pos
+        while i > 0 and not self._is_word_char(buf[i - 1]):
+            i -= 1
+        while i > 0 and self._is_word_char(buf[i - 1]):
+            i -= 1
+        return i
+
+    def _word_right(self):
+        buf = self.command_buffer
+        n = len(buf)
+        i = self.cursor_pos
+        while i < n and self._is_word_char(buf[i]):
+            i += 1
+        while i < n and not self._is_word_char(buf[i]):
+            i += 1
+        return i
+
+    def _insert_char(self, c):
+        self.command_buffer = (
+            self.command_buffer[:self.cursor_pos] + c + self.command_buffer[self.cursor_pos:]
+        )
+        self.cursor_pos += 1
+
+    def _backspace(self):
+        if self.cursor_pos > 0:
+            self.command_buffer = (
+                self.command_buffer[:self.cursor_pos - 1]
+                + self.command_buffer[self.cursor_pos:]
+            )
+            self.cursor_pos -= 1
+
+    def _delete_forward(self):
+        if self.cursor_pos < len(self.command_buffer):
+            self.command_buffer = (
+                self.command_buffer[:self.cursor_pos]
+                + self.command_buffer[self.cursor_pos + 1:]
+            )
+
+    def _delete_word_back(self):
+        target = self._word_left()
+        self.command_buffer = (
+            self.command_buffer[:target] + self.command_buffer[self.cursor_pos:]
+        )
+        self.cursor_pos = target
+
+    def _set_buffer(self, text):
+        self.command_buffer = text
+        self.cursor_pos = len(text)
+
+    def _clear_buffer(self):
+        self.command_buffer = ""
+        self.cursor_pos = 0
+        self.cmd_view_offset = 0
 
     # == FILE I/O ==
     def _saves_dir(self):
@@ -428,6 +554,131 @@ class LogiBox:
         self.engine.import_state(lines)
         return path
 
+    # == CLIPBOARD ==
+    def _copy_to_clipboard(self, text):
+        """Copy text to the system clipboard via platform-native tools."""
+        if sys.platform == "win32":
+            subprocess.run(["clip"], input=text, text=True, check=True, shell=False)
+        elif sys.platform == "darwin":
+            subprocess.run(["pbcopy"], input=text, text=True, check=True)
+        else:
+            try:
+                subprocess.run(
+                    ["xclip", "-selection", "clipboard"],
+                    input=text, text=True, check=True,
+                )
+            except FileNotFoundError:
+                try:
+                    subprocess.run(
+                        ["xsel", "--clipboard", "--input"],
+                        input=text, text=True, check=True,
+                    )
+                except FileNotFoundError:
+                    raise OSError("xclip or xsel is required on Linux")
+
+    # == BULK SET / SHOW ==
+    def _do_set(self, args):
+        if "=" not in args:
+            self.log("Usage: set <n> = <up to 16 binary digits>")
+            return
+        prefix, value = args.split("=", 1)
+        prefix = prefix.strip()
+        value = re.sub(r"\s+", "", value)
+        if not prefix:
+            self.log("set: missing variable name.")
+            return
+        if not PREFIX_RE.match(prefix):
+            self.log(f"set: invalid name {prefix!r}.")
+            return
+        if not value:
+            self.log("set: missing value.")
+            return
+        if not BITS_RE.match(value):
+            self.log(f"set: value must contain only 0 and 1.")
+            return
+        if len(value) > 16:
+            self.log(f"set: value is {len(value)} digits; maximum is 16.")
+            return
+
+        padded = value.zfill(16)
+        for i in range(16):
+            bit = padded[15 - i]
+            self.engine.evaluate(f"{prefix}{i} = {bit}")
+        decimal = int(padded, 2)
+        self.log(f"Set: {prefix} = {padded}  ({decimal}, 0x{decimal:04X})")
+
+    def _do_show(self, args):
+        prefix = args.strip()
+        if not prefix:
+            self.log("Usage: show <n>")
+            return
+        if not PREFIX_RE.match(prefix):
+            self.log(f"show: invalid name {prefix!r}.")
+            return
+
+        bits = []
+        any_defined = False
+        for i in range(15, -1, -1):
+            name = f"{prefix}{i}"
+            if name not in self.engine.variables:
+                bits.append("?")
+            else:
+                any_defined = True
+                try:
+                    bits.append(str(int(self.engine.lookup(name))))
+                except (NameError, RuntimeError):
+                    bits.append("?")
+
+        if not any_defined:
+            self.log(f"show: no variables found matching {prefix}0..{prefix}15.")
+            return
+        binstr = "".join(bits)
+        if "?" in binstr:
+            self.log(f"{prefix} = {binstr}  (some bits undefined)")
+        else:
+            val = int(binstr, 2)
+            self.log(f"{prefix} = {binstr}  ({val}, 0x{val:04X})")
+
+    # == COPY ==
+    def _do_copy(self, args):
+        if not args:
+            self.log("Usage: copy <number of lines>")
+            return
+        try:
+            n = int(args)
+        except ValueError:
+            self.log(f"copy: {args!r} is not a valid number.")
+            return
+        if n <= 0:
+            self.log("copy: number of lines must be positive.")
+            return
+
+        # Skip the last line: it is our own '> copy N' echo.
+        history = self.workspace_lines[:-1]
+        available = len(history)
+        if n > available:
+            self.log(f"copy: only {available} line(s) available to copy.")
+            return
+
+        text = "\n".join(history[-n:])
+        try:
+            self._copy_to_clipboard(text)
+        except FileNotFoundError as e:
+            self.log(f"copy: clipboard tool not found ({e.filename!r}).")
+            return
+        except subprocess.CalledProcessError as e:
+            self.log(f"copy: clipboard tool failed (exit {e.returncode}).")
+            return
+        except OSError as e:
+            self.log(f"copy: {e}")
+            return
+        except Exception as e:
+            self.log(f"copy: unexpected error: {e}")
+            return
+
+        suffix = "" if n == 1 else "s"
+        self.log(f"Copied last {n} line{suffix} to clipboard.")
+
     # == COMMAND DISPATCH ==
     def handle_command(self, cmd):
         cmd = cmd.strip()
@@ -449,14 +700,19 @@ class LogiBox:
             self.log("  help operators   - Lists all available operators.")
             self.log("  help parameters  - Lists all available parameters.")
             self.log("  help parantheses - Displays information about parantheses.")
+            self.log("  help batch       - Explains the 'set' and 'show' commands.")
+            self.log("  help keys        - Lists keyboard shortcuts.")
         elif inst == "help commands":
             self.log("Commands:")
             self.log("  help   - Displays the help menu.")
             self.log("  clear  - Clears the workspace.")
             self.log("  exit   - Terminates the workspace.")
             self.log("  var    - Lists all variables.")
-            self.log("  save X - Saves current variables to 'saves/X.txt'.")
+            self.log("  set?   - Batch-assigns a 16-bit register. See 'help batch'.")
+            self.log("  show?  - Displays a 16-bit register. See 'help batch'.")
+            self.log("  save X - Saves variables to 'saves/X.txt'.")
             self.log("  load X - Loads variables from 'saves/X.txt'.")
+            self.log("  copy N - Copies the last N workspace lines to the clipboard.")
             self.log("You can use commands anytime.")
         elif inst == "help operators":
             self.log("Operators:")
@@ -471,16 +727,9 @@ class LogiBox:
             self.log("A value is expected before and after an operator, with spaces in between.")
         elif inst == "help parameters":
             self.log("Parameters:")
-            self.log("  *      - Inverts a variable.")
+            self.log("  *      - Inverts a variable. Used for NOT.")
             self.log("  =      - Assigns a variable to a value.")
             self.log("Parameters can only be used after a variable.")
-            self.log("Example usage:")
-            self.log("> p = 1")
-            self.log("> q = 0")
-            self.log("> r = p* OR q")
-            self.log("> s = r*")
-            self.log("> s")
-            self.log("Output: 1")
             self.log("Entering a value performs calculation and outputs the result.")
         elif inst in ("help parantheses", "help paranthesis"):
             self.log("Parentheses:")
@@ -490,19 +739,43 @@ class LogiBox:
             self.log("Parantheses must include a value inside them.")
             self.log("A paranthesis is opened with '(' and closed with ')'.")
             self.log("A closed paranthesis is expected in every procedure.")
-            self.log("Example usage:")
-            self.log("> t = ((p AND q*) IMPLY (r OR s*)) XOR s*")
-            self.log("Output: 0")
+        elif inst == "help batch":
+            self.log("Batch Commands:")
+            self.log("  set <n> = <bits>")
+            self.log("    Assigns <n>0..<n>15 from a binary string.")
+            self.log("    Leftmost digit is the highest bit; upper bits pad with 0.")
+            self.log("    Value must be 1-16 digits of only 0 and 1 (spaces allowed).")
+            self.log("    Existing bits are overwritten.")
+            self.log("  show <n>")
+            self.log("    Displays <n>0..<n>15 as binary, decimal, and hex.")
+            self.log("    Unassigned or unresolvable bits show as '?'.")
+        elif inst == "help keys":
+            self.log("Keyboard:")
+            self.log("  Left / Right       - Move cursor within the input line.")
+            self.log("  Ctrl+(Left/Right)  - Jump cursor by word.")
+            self.log("  Home / End         - Jump cursor to start / end of input.")
+            self.log("  Backspace / Del    - Delete char before / at cursor.")
+            self.log("  Ctrl+Backspace     - Delete the previous word.")
+            self.log("  Up / Down          - Previous / next command from history.")
+            self.log("  PageUp / PageDown  - Scroll the workspace.")
+            self.log("  Mouse wheel        - Scroll the workspace.")
+            self.log("To copy text, use the 'copy N' command (see 'help commands').")
         elif inst == "var":
             if not self.engine.variables:
                 self.log("  (no variables defined)")
             else:
                 for name in self.engine.variables:
                     self.log(f"  {name} = {self.engine.sources[name]}")
+        elif inst == "set" or inst.startswith("set "):
+            self._do_set(cmd[3:].strip())
+        elif inst == "show" or inst.startswith("show "):
+            self._do_show(cmd[4:].strip())
+        elif inst == "copy" or inst.startswith("copy "):
+            self._do_copy(cmd[4:].strip())
         elif inst == "save" or inst.startswith("save "):
             name = cmd[4:].strip()
             if not name:
-                self.log("Usage: save <name>")
+                self.log("Usage: save <n>")
             else:
                 try:
                     path = self._save(name)
@@ -512,7 +785,7 @@ class LogiBox:
         elif inst == "load" or inst.startswith("load "):
             name = cmd[4:].strip()
             if not name:
-                self.log("Usage: load <name>")
+                self.log("Usage: load <n>")
             else:
                 try:
                     path = self._load(name)
@@ -521,7 +794,6 @@ class LogiBox:
                 except Exception as e:
                     self.log(f"Load failed: {e}")
         else:
-            # feed everything else to the logic engine
             try:
                 result = self.engine.evaluate(cmd)
                 kind = result[0]
@@ -533,7 +805,6 @@ class LogiBox:
                         self.log(f"Pending: {name} := {self.engine.sources[name]}")
                     else:
                         self.log(f"Assigned: {name}")
-                # ("empty",) -> nothing to print
             except SyntaxError as e:
                 self.log(f"Syntax error: {e}")
             except NameError as e:
@@ -556,7 +827,6 @@ class LogiBox:
                     _, _, _, _, bstate = curses.getmouse()
                 except curses.error:
                     continue
-                # BUTTON5_PRESSED isn't defined on every windows-curses build
                 scroll_up = curses.BUTTON4_PRESSED
                 scroll_down = getattr(curses, "BUTTON5_PRESSED", 0x00200000)
                 if bstate & scroll_up:
@@ -567,56 +837,82 @@ class LogiBox:
                     self.draw_workspace()
                 continue
 
-            if ch == curses.KEY_PPAGE:       # PageUp - scroll workspace up
+            # Workspace scroll
+            if ch == curses.KEY_PPAGE:
                 page = max(1, self.workspace_height - 3)
                 self.scroll_offset += page
                 self.draw_workspace()
                 continue
-
-            if ch == curses.KEY_NPAGE:       # PageDown - scroll workspace down
+            if ch == curses.KEY_NPAGE:
                 page = max(1, self.workspace_height - 3)
                 self.scroll_offset = max(0, self.scroll_offset - page)
                 self.draw_workspace()
                 continue
 
-            if ch == curses.KEY_HOME:        # Home - jump to top of workspace
-                self.scroll_offset = len(self.workspace_lines)
-                self.draw_workspace()
+            # -------- Cursor movement --------
+            if ch == curses.KEY_LEFT:
+                if self.cursor_pos > 0:
+                    self.cursor_pos -= 1
+                continue
+            if ch == curses.KEY_RIGHT:
+                if self.cursor_pos < len(self.command_buffer):
+                    self.cursor_pos += 1
+                continue
+            if ch in CTRL_LEFT_CODES:
+                self.cursor_pos = self._word_left()
+                continue
+            if ch in CTRL_RIGHT_CODES:
+                self.cursor_pos = self._word_right()
+                continue
+            if ch == curses.KEY_HOME:
+                self.cursor_pos = 0
+                continue
+            if ch == curses.KEY_END:
+                self.cursor_pos = len(self.command_buffer)
                 continue
 
-            if ch == curses.KEY_END:         # End - jump to latest
-                self.scroll_offset = 0
-                self.draw_workspace()
+            # -------- Editing --------
+            # Ctrl+Backspace first (its code may overlap with a BS variant).
+            if ch in CTRL_BACKSPACE_CODES:
+                self._delete_word_back()
+                continue
+            if ch == curses.KEY_BACKSPACE or ch in REGULAR_BS_EXTRA:
+                self._backspace()
+                continue
+            if ch == curses.KEY_DC:
+                self._delete_forward()
                 continue
 
+            # -------- Submit / history --------
             if ch in (curses.KEY_ENTER, 10, 13):
                 cmd = self.command_buffer
-                self.command_buffer = ""
+                self._clear_buffer()
                 self.history_index = None
                 self.handle_command(cmd)
+                continue
 
-            elif ch in (curses.KEY_BACKSPACE, 127, 8):
-                self.command_buffer = self.command_buffer[:-1]
-
-            elif ch == curses.KEY_UP:
+            if ch == curses.KEY_UP:
                 if self.history:
                     if self.history_index is None:
                         self.history_index = len(self.history) - 1
                     else:
                         self.history_index = max(0, self.history_index - 1)
-                    self.command_buffer = self.history[self.history_index]
+                    self._set_buffer(self.history[self.history_index])
+                continue
 
-            elif ch == curses.KEY_DOWN:
+            if ch == curses.KEY_DOWN:
                 if self.history and self.history_index is not None:
                     self.history_index += 1
                     if self.history_index >= len(self.history):
                         self.history_index = None
-                        self.command_buffer = ""
+                        self._clear_buffer()
                     else:
-                        self.command_buffer = self.history[self.history_index]
+                        self._set_buffer(self.history[self.history_index])
+                continue
 
-            elif 32 <= ch <= 126:  # printable ASCII
-                self.command_buffer += chr(ch)
+            # Printable ASCII -> insert at cursor
+            if 32 <= ch <= 126:
+                self._insert_char(chr(ch))
 
 
 def main(stdscr):
