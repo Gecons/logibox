@@ -1,4 +1,4 @@
-\# Sample LogiBox circuits
+### Sample LogiBox circuits
 
 These samples are pre-saved in the release (zip folder).
 You can change or delete them freely.
