@@ -12,9 +12,9 @@ load your workspace.
 
 Grab the latest build from [Releases Page](https://github.com/Gecons/logibox/releases).
 Extract the zip anywhere, open the "LogiBox" folder, then double-click `LogiBox.exe`.
-Ignore the "_internal" folder inside the folder.
-There are loadable pre-written samples inside the "saves" folder.
-Use the `load` command inside LogiBox to load saves.
+Ignore the "_internal" folder.
+There are loadable pre-written samples in the "saves" folder.
+Use the `load` command in LogiBox to load saves.
 
 Windows may show a SmartScreen warning the first time
 ("Windows protected your PC"). Click **More info** → **Run anyway**.
