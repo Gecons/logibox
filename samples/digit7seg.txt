@@ -1,0 +1,39 @@
+# LogiBox 4-bit BCD to 7-segment decoder
+# 
+# Inputs:  D C B A   (4-bit binary number, D = MSB)
+# Outputs: seg_a..seg_g (1 = segment lit)
+# 
+# Segment layout:        Try it:
+#       aaa                D = 0
+#      f   b                C = 1
+#      f   b                B = 0
+#       ggg                A = 1   (binary 0101 = 5)
+#      e   c                seg_a, seg_c, seg_d, seg_f, seg_g
+#      e   c                light up - that's a '5'.
+#       ddd
+# 
+# Inputs above 9 (binary 1010..1111) produce undefined output;
+# this is a BCD decoder and ignores invalid inputs.
+# 
+# m0..m9 are the 10 minterms - each detects one digit value.
+D = 0
+C = 0
+B = 0
+A = 0
+m0 = (((D* AND C*) AND B*) AND A*)
+m1 = (((D* AND C*) AND B*) AND A)
+m2 = (((D* AND C*) AND B) AND A*)
+m3 = (((D* AND C*) AND B) AND A)
+m4 = (((D* AND C) AND B*) AND A*)
+m5 = (((D* AND C) AND B*) AND A)
+m6 = (((D* AND C) AND B) AND A*)
+m7 = (((D* AND C) AND B) AND A)
+m8 = (((D AND C*) AND B*) AND A*)
+m9 = (((D AND C*) AND B*) AND A)
+seg_a = (((((((m0 OR m2) OR m3) OR m5) OR m6) OR m7) OR m8) OR m9)
+seg_b = (((((((m0 OR m1) OR m2) OR m3) OR m4) OR m7) OR m8) OR m9)
+seg_c = ((((((((m0 OR m1) OR m3) OR m4) OR m5) OR m6) OR m7) OR m8) OR m9)
+seg_d = ((((((m0 OR m2) OR m3) OR m5) OR m6) OR m8) OR m9)
+seg_e = (((m0 OR m2) OR m6) OR m8)
+seg_f = (((((m0 OR m4) OR m5) OR m6) OR m8) OR m9)
+seg_g = ((((((m2 OR m3) OR m4) OR m5) OR m6) OR m8) OR m9)
