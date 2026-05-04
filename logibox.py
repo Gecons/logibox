@@ -52,6 +52,13 @@ class LogicEngine:
         self._evaluating = set()
 
     def evaluate(self, source):
+        # End-of-line comments are allowed only on assignments. A '#' in any
+        # other context falls through to tokenize and produces the usual
+        # "unexpected character" syntax error. Pure-comment lines are empty.
+        source = self._strip_assignment_comment(source)
+        if source.lstrip().startswith("#"):
+            return ("empty",)
+
         tokens = self.tokenize(source)
         if len(tokens) == 1:
             return ("empty",)
@@ -72,6 +79,18 @@ class LogicEngine:
 
         return ("value", self._eval(ast))
 
+    @staticmethod
+    def _strip_assignment_comment(source):
+        """If the line is an assignment ('=' before '#'), drop everything
+        from '#' onward. Otherwise leave the source as-is."""
+        hash_pos = source.find("#")
+        if hash_pos == -1:
+            return source
+        eq_pos = source.find("=")
+        if eq_pos != -1 and eq_pos < hash_pos:
+            return source[:hash_pos].rstrip()
+        return source
+
     def lookup(self, name):
         if name not in self.variables:
             raise NameError(f"{name!r} is not defined")
@@ -84,6 +103,8 @@ class LogicEngine:
         fresh = LogicEngine()
         for i, line in enumerate(lines, 1):
             line = line.strip()
+            # Blank lines and full-line comments are skipped here. Mid-line
+            # comments are stripped inside evaluate().
             if not line or line.startswith("#"):
                 continue
             try:
@@ -283,6 +304,30 @@ BITS_RE      = re.compile(r"^[01]+$")
 
 WRAP_INDENT = "  "  # 2-space prefix for continuation rows
 
+# Output category tags. Each call to log() may pass one of these to mark
+# what kind of line it is, so the workspace can color it accordingly.
+TAG_DEFAULT = "default"
+TAG_PROMPT  = "prompt"      # the '> command' echo
+TAG_OUTPUT  = "output"      # 'Output: 1' results
+TAG_ASSIGN  = "assign"      # 'Assigned: foo' confirmations
+TAG_PENDING = "pending"     # deferred assignment notices
+TAG_ERROR   = "error"       # syntax/undefined/runtime errors
+TAG_INFO    = "info"        # save/load/copy confirmations
+TAG_HEADER  = "header"      # banner / section headings in help
+
+# Foreground color name per category. Background is whatever the terminal
+# already uses, so the workspace blends in naturally.
+TAG_COLORS = {
+    TAG_DEFAULT: "white",
+    TAG_PROMPT:  "cyan",
+    TAG_OUTPUT:  "yellow",
+    TAG_ASSIGN:  "green",
+    TAG_PENDING: "magenta",
+    TAG_ERROR:   "red",
+    TAG_INFO:    "cyan",
+    TAG_HEADER:  "yellow",
+}
+
 # Ctrl-key codes differ between Windows (windows-curses) and Unix (ncurses).
 # Windows: regular Backspace = 8, Ctrl+Backspace = 127, Ctrl+(Left/Right) = 443/444
 # Unix:    regular Backspace = 127, Ctrl+Backspace = 8, Ctrl+(Left/Right) = 545/560
@@ -300,14 +345,27 @@ else:
 
 def wrap_line(line, width):
     """Wrap a logical line into visual rows.
-    First row has no extra indent; continuation rows are prefixed with
-    WRAP_INDENT. The indent is dropped on very narrow windows where it
-    would leave almost no room for actual content per row."""
+    Continuation rows match the line's own leading whitespace, plus an
+    extra WRAP_INDENT, so wrapped output stays visually aligned with
+    the source indent. The extra indent drops on very narrow windows
+    where it would leave almost no room for content."""
     if width <= 0 or len(line) <= width:
         return [line]
+
+    # Preserve the source's own leading whitespace on every continuation row.
+    leading = ""
+    for c in line:
+        if c == " " or c == "\t":
+            leading += c
+        else:
+            break
+
     rows = [line[:width]]
-    # Use the indent only when at least 2 chars of content fit after it.
-    indent = WRAP_INDENT if width >= len(WRAP_INDENT) + 2 else ""
+    indent = leading + WRAP_INDENT
+    if len(indent) + 2 > width:
+        # Window too narrow to afford the extra indent - fall back to
+        # just matching leading whitespace, or no indent at all.
+        indent = leading if len(leading) + 2 <= width else ""
     cont_width = max(1, width - len(indent))
     i = width
     while i < len(line):
@@ -319,7 +377,7 @@ def wrap_line(line, width):
 class LogiBox:
     def __init__(self, stdscr):
         self.stdscr = stdscr
-        self.workspace_lines = []   # everything shown in the top pane
+        self.workspace_lines = []   # list of (text, tag); tag drives coloring
         self.command_buffer = ""    # what the user is currently typing
         self.cursor_pos = 0         # cursor index within command_buffer
         self.cmd_view_offset = 0    # horizontal scroll for long input lines
@@ -329,10 +387,12 @@ class LogiBox:
         self.running = True
 
         self.engine = LogicEngine()
+        self.attrs = {}             # tag -> curses attribute (set in _init_colors)
 
         curses.curs_set(1)
         curses.mousemask(curses.ALL_MOUSE_EVENTS)
         curses.mouseinterval(0)
+        self._init_colors()
         self.stdscr.clear()
 
         self._build_layout()
@@ -348,8 +408,8 @@ class LogiBox:
         self.command_win.keypad(True)
 
     def _welcome(self):
-        self.log("===     LogiBox by Gecons     ===")
-        self.log("=== Logic Sandbox Environment ===")
+        self.log("===     LogiBox by Gecons     ===", TAG_HEADER)
+        self.log("=== Logic Sandbox Environment ===", TAG_HEADER)
         self.log("Type 'help' for commands, 'quit' to exit.")
         self.log("")
 
@@ -365,15 +425,39 @@ class LogiBox:
         self._build_layout()
         self.draw_workspace()
 
+    # == COLORS ==
+    def _init_colors(self):
+        """Allocate one curses color pair per output category. Background
+        is left at the terminal default so the workspace blends in with
+        the user's color scheme."""
+        self.attrs = {tag: 0 for tag in TAG_COLORS}
+        if not curses.has_colors():
+            return
+        try:
+            curses.start_color()
+            curses.use_default_colors()
+        except curses.error:
+            return
+        for i, (tag, name) in enumerate(TAG_COLORS.items(), start=1):
+            color = getattr(curses, f"COLOR_{name.upper()}", curses.COLOR_WHITE)
+            try:
+                curses.init_pair(i, color, -1)   # -1 = default background
+                self.attrs[tag] = curses.color_pair(i)
+            except curses.error:
+                self.attrs[tag] = 0
+
     # == DRAWING ==
     def _wrap_width(self):
         """Column budget for a single row of workspace text."""
         return max(1, self.width - 4)
 
     def draw_workspace(self):
+        attr_default = self.attrs.get(TAG_DEFAULT, 0)
         self.workspace_win.erase()
+        self.workspace_win.attrset(attr_default)
         self.workspace_win.border()
-        self.workspace_win.addstr(0, 2, " Workspace ")
+        self.workspace_win.addstr(0, 2, " Workspace ",
+                                  self.attrs.get(TAG_HEADER, attr_default))
 
         inner_h = self.workspace_height - 2
         wrap_w = self._wrap_width()
@@ -381,8 +465,9 @@ class LogiBox:
         # Flatten logical lines into visual rows. This happens every draw so
         # the layout always matches the current window width.
         visual_rows = []
-        for line in self.workspace_lines:
-            visual_rows.extend(wrap_line(line, wrap_w))
+        for text, tag in self.workspace_lines:
+            for row in wrap_line(text, wrap_w):
+                visual_rows.append((row, tag))
 
         total = len(visual_rows)
         max_offset = max(0, total - inner_h)
@@ -390,35 +475,42 @@ class LogiBox:
 
         end = total - self.scroll_offset
         start = max(0, end - inner_h)
-        visible = visual_rows[start:end]
 
-        for i, row in enumerate(visible):
+        for i, (row, tag) in enumerate(visual_rows[start:end]):
+            attr = self.attrs.get(tag, attr_default)
             try:
-                self.workspace_win.addstr(i + 1, 2, row[: self.width - 4])
+                self.workspace_win.addstr(i + 1, 2, row[: self.width - 4], attr)
             except curses.error:
                 pass
 
         # indicators on the borders when there's hidden content
         if start > 0:
-            tag = f" -- {start} more above -- "
+            label = f" -- {start} more above -- "
             try:
-                self.workspace_win.addstr(0, max(2, self.width - len(tag) - 2), tag)
+                self.workspace_win.addstr(
+                    0, max(2, self.width - len(label) - 2), label,
+                    self.attrs.get(TAG_INFO, attr_default))
             except curses.error:
                 pass
         if self.scroll_offset > 0:
-            tag = f" -- {self.scroll_offset} more below -- "
+            label = f" -- {self.scroll_offset} more below -- "
             try:
-                self.workspace_win.addstr(self.workspace_height - 1, 2, tag)
+                self.workspace_win.addstr(
+                    self.workspace_height - 1, 2, label,
+                    self.attrs.get(TAG_INFO, attr_default))
             except curses.error:
                 pass
 
         self.workspace_win.refresh()
 
     def draw_command_line(self):
+        attr_default = self.attrs.get(TAG_DEFAULT, 0)
         self.command_win.erase()
+        self.command_win.attrset(attr_default)
         self.command_win.border()
         try:
-            self.command_win.addstr(0, 2, " Command ")
+            self.command_win.addstr(0, 2, " Command ",
+                                    self.attrs.get(TAG_HEADER, attr_default))
         except curses.error:
             pass
 
@@ -437,7 +529,9 @@ class LogiBox:
         display = self.command_buffer[slice_start:slice_end]
 
         try:
-            self.command_win.addstr(1, 2, prompt + display)
+            self.command_win.addstr(1, 2, prompt,
+                                    self.attrs.get(TAG_PROMPT, attr_default))
+            self.command_win.addstr(1, 2 + len(prompt), display, attr_default)
         except curses.error:
             pass
 
@@ -449,9 +543,9 @@ class LogiBox:
         self.command_win.refresh()
 
     # == HELPERS ==
-    def log(self, text=""):
+    def log(self, text="", tag=TAG_DEFAULT):
         """Append a line to the workspace pane."""
-        self.workspace_lines.append(text)
+        self.workspace_lines.append((text, tag))
         # If the user is scrolled up, keep their view anchored by advancing
         # the offset past however many visual rows this new line produces.
         if self.scroll_offset > 0:
@@ -579,25 +673,25 @@ class LogiBox:
     # == BULK SET / SHOW ==
     def _do_set(self, args):
         if "=" not in args:
-            self.log("Usage: set <n> = <up to 16 binary digits>")
+            self.log("Usage: set <n> = <up to 16 binary digits>", TAG_ERROR)
             return
         prefix, value = args.split("=", 1)
         prefix = prefix.strip()
         value = re.sub(r"\s+", "", value)
         if not prefix:
-            self.log("set: missing variable name.")
+            self.log("set: missing variable name.", TAG_ERROR)
             return
         if not PREFIX_RE.match(prefix):
-            self.log(f"set: invalid name {prefix!r}.")
+            self.log(f"set: invalid name {prefix!r}.", TAG_ERROR)
             return
         if not value:
-            self.log("set: missing value.")
+            self.log("set: missing value.", TAG_ERROR)
             return
         if not BITS_RE.match(value):
-            self.log(f"set: value must contain only 0 and 1.")
+            self.log(f"set: value must contain only 0 and 1.", TAG_ERROR)
             return
         if len(value) > 16:
-            self.log(f"set: value is {len(value)} digits; maximum is 16.")
+            self.log(f"set: value is {len(value)} digits; maximum is 16.", TAG_ERROR)
             return
 
         padded = value.zfill(16)
@@ -605,15 +699,15 @@ class LogiBox:
             bit = padded[15 - i]
             self.engine.evaluate(f"{prefix}{i} = {bit}")
         decimal = int(padded, 2)
-        self.log(f"Set: {prefix} = {padded}  ({decimal}, 0x{decimal:04X})")
+        self.log(f"Set: {prefix} = {padded}  ({decimal}, 0x{decimal:04X})", TAG_OUTPUT)
 
     def _do_show(self, args):
         prefix = args.strip()
         if not prefix:
-            self.log("Usage: show <n>")
+            self.log("Usage: show <n>", TAG_ERROR)
             return
         if not PREFIX_RE.match(prefix):
-            self.log(f"show: invalid name {prefix!r}.")
+            self.log(f"show: invalid name {prefix!r}.", TAG_ERROR)
             return
 
         bits = []
@@ -630,187 +724,249 @@ class LogiBox:
                     bits.append("?")
 
         if not any_defined:
-            self.log(f"show: no variables found matching {prefix}0..{prefix}15.")
+            self.log(f"show: no variables found matching {prefix}0..{prefix}15.",
+                     TAG_ERROR)
             return
         binstr = "".join(bits)
         if "?" in binstr:
-            self.log(f"{prefix} = {binstr}  (some bits undefined)")
+            self.log(f"{prefix} = {binstr}  (some bits undefined)", TAG_PENDING)
         else:
             val = int(binstr, 2)
-            self.log(f"{prefix} = {binstr}  ({val}, 0x{val:04X})")
+            self.log(f"{prefix} = {binstr}  ({val}, 0x{val:04X})", TAG_OUTPUT)
 
     # == COPY ==
     def _do_copy(self, args):
         if not args:
-            self.log("Usage: copy <number of lines>")
+            self.log("Usage: copy <number of lines>", TAG_ERROR)
             return
         try:
             n = int(args)
         except ValueError:
-            self.log(f"copy: {args!r} is not a valid number.")
+            self.log(f"copy: {args!r} is not a valid number.", TAG_ERROR)
             return
         if n <= 0:
-            self.log("copy: number of lines must be positive.")
+            self.log("copy: number of lines must be positive.", TAG_ERROR)
             return
 
         # Skip the last line: it is our own '> copy N' echo.
-        history = self.workspace_lines[:-1]
+        history = [text for text, _ in self.workspace_lines[:-1]]
         available = len(history)
         if n > available:
-            self.log(f"copy: only {available} line(s) available to copy.")
+            self.log(f"copy: only {available} line(s) available to copy.", TAG_ERROR)
             return
 
         text = "\n".join(history[-n:])
         try:
             self._copy_to_clipboard(text)
         except FileNotFoundError as e:
-            self.log(f"copy: clipboard tool not found ({e.filename!r}).")
+            self.log(f"copy: clipboard tool not found ({e.filename!r}).", TAG_ERROR)
             return
         except subprocess.CalledProcessError as e:
-            self.log(f"copy: clipboard tool failed (exit {e.returncode}).")
+            self.log(f"copy: clipboard tool failed (exit {e.returncode}).", TAG_ERROR)
             return
         except OSError as e:
-            self.log(f"copy: {e}")
+            self.log(f"copy: {e}", TAG_ERROR)
             return
         except Exception as e:
-            self.log(f"copy: unexpected error: {e}")
+            self.log(f"copy: unexpected error: {e}", TAG_ERROR)
             return
 
         suffix = "" if n == 1 else "s"
-        self.log(f"Copied last {n} line{suffix} to clipboard.")
+        self.log(f"Copied last {n} line{suffix} to clipboard.", TAG_INFO)
+
+    # == HELP PAGES ==
+    # Help text is data, not control flow. Each entry is a list of
+    # (text, tag) tuples; handle_command just iterates one of them.
+    def _help_pages(self):
+        return {
+            "help": [
+                ("Help Menu:", TAG_HEADER),
+                ("  help commands    - Lists all available commands.", TAG_DEFAULT),
+                ("  help operators   - Lists all available operators.", TAG_DEFAULT),
+                ("  help parameters  - Lists all available parameters.", TAG_DEFAULT),
+                ("  help parantheses - Displays information about parantheses.", TAG_DEFAULT),
+                ("  help batch       - Explains the 'set' and 'show' commands.", TAG_DEFAULT),
+                ("  help keys        - Lists keyboard shortcuts.", TAG_DEFAULT),
+            ],
+            "help commands": [
+                ("Commands:", TAG_HEADER),
+                ("  help    - Displays the help menu.", TAG_DEFAULT),
+                ("  clear   - Clears the workspace.", TAG_DEFAULT),
+                ("  exit    - Terminates the workspace.", TAG_DEFAULT),
+                ("  var     - Lists all variables.", TAG_DEFAULT),
+                ("  set?    - Batch-assigns a 16-bit register. See 'help batch'.", TAG_DEFAULT),
+                ("  show?   - Displays a 16-bit register. See 'help batch'.", TAG_DEFAULT),
+                ("  save X  - Saves variables to 'saves/X.txt'.", TAG_DEFAULT),
+                ("  load X  - Loads variables from 'saves/X.txt'.", TAG_DEFAULT),
+                ("  copy N  - Copies the last N workspace lines to the clipboard.", TAG_DEFAULT),
+                ("You can use commands anytime.", TAG_DEFAULT),
+            ],
+            "help operators": [
+                ("Operators:", TAG_HEADER),
+                ("  OR     - Used for an OR gate.", TAG_DEFAULT),
+                ("  AND    - Used for an AND gate.", TAG_DEFAULT),
+                ("  XOR    - Used for an XOR gate.", TAG_DEFAULT),
+                ("  IMPLY  - Used for an IMPLY gate.", TAG_DEFAULT),
+                ("  NOR    - Used for a NOT OR gate.", TAG_DEFAULT),
+                ("  NAND   - Used for a NOT AND gate.", TAG_DEFAULT),
+                ("  XNOR   - Used for a NOT XOR gate.", TAG_DEFAULT),
+                ("  NIMPLY - Used for a NOT IMPLY gate.", TAG_DEFAULT),
+                ("A value is expected before and after an operator, with spaces in between.", TAG_DEFAULT),
+            ],
+            "help parameters": [
+                ("Parameters:", TAG_HEADER),
+                ("  *      - Inverts a variable. Used for NOT.", TAG_DEFAULT),
+                ("  =      - Assigns a variable to a value.", TAG_DEFAULT),
+                ("  #      - Begins a comment (assignment lines only).", TAG_DEFAULT),
+                ("Parameters can only be used after a variable.", TAG_DEFAULT),
+                ("Entering a value performs calculation and outputs the result.", TAG_DEFAULT),
+            ],
+            "help parantheses": [
+                ("Parentheses:", TAG_HEADER),
+                ("  (      - Opening Parenthesis", TAG_DEFAULT),
+                ("  )      - Closing Parenthesis", TAG_DEFAULT),
+                ("Parantheses are used to specify operation precedence.", TAG_DEFAULT),
+                ("Parantheses must include a value inside them.", TAG_DEFAULT),
+                ("A paranthesis is opened with '(' and closed with ')'.", TAG_DEFAULT),
+                ("A closed paranthesis is expected in every procedure.", TAG_DEFAULT),
+            ],
+            "help batch": [
+                ("Batch Commands:", TAG_HEADER),
+                ("  set <n> = <bits>", TAG_DEFAULT),
+                ("    Assigns <n>0..<n>15 from a binary string.", TAG_DEFAULT),
+                ("    Leftmost digit is the highest bit; upper bits pad with 0.", TAG_DEFAULT),
+                ("    Value must be 1-16 digits of only 0 and 1 (spaces allowed).", TAG_DEFAULT),
+                ("    Existing bits are overwritten.", TAG_DEFAULT),
+                ("  show <n>", TAG_DEFAULT),
+                ("    Displays <n>0..<n>15 as binary, decimal, and hex.", TAG_DEFAULT),
+                ("    Unassigned or unresolvable bits show as '?'.", TAG_DEFAULT),
+            ],
+            "help keys": [
+                ("Keyboard:", TAG_HEADER),
+                ("  Left / Right       - Move cursor within the input line.", TAG_DEFAULT),
+                ("  Ctrl+(Left/Right)  - Jump cursor by word.", TAG_DEFAULT),
+                ("  Home / End         - Jump cursor to start / end of input.", TAG_DEFAULT),
+                ("  Backspace / Del    - Delete char before / at cursor.", TAG_DEFAULT),
+                ("  Ctrl+Backspace     - Delete the previous word.", TAG_DEFAULT),
+                ("  Up / Down          - Previous / next command from history.", TAG_DEFAULT),
+                ("  PageUp / PageDown  - Scroll the workspace.", TAG_DEFAULT),
+                ("  Mouse wheel        - Scroll the workspace.", TAG_DEFAULT),
+                ("To copy text, use the 'copy N' command (see 'help commands').", TAG_DEFAULT),
+            ],
+        }
+
+    # == COMMAND HANDLERS ==
+    # Each handler takes the args string (everything after the command word,
+    # already stripped). Handlers for argument-less commands accept and
+    # ignore args, so the dispatch shape stays uniform.
+
+    def _cmd_quit(self, args):
+        self.running = False
+
+    def _cmd_clear(self, args):
+        self.workspace_lines = []
+        self._welcome()
+
+    def _cmd_help(self, args):
+        # Resolve the requested page; 'help paranthesis' falls back to
+        # 'help parantheses' so both spellings work.
+        key = "help" if not args else f"help {args.casefold()}"
+        if key == "help paranthesis":
+            key = "help parantheses"
+        pages = self._help_pages()
+        page = pages.get(key)
+        if page is None:
+            self.log(f"help: no page named {args!r}.", TAG_ERROR)
+            return
+        for text, tag in page:
+            self.log(text, tag)
+
+    def _cmd_var(self, args):
+        if not self.engine.variables:
+            self.log("  (no variables defined)")
+            return
+        for name in self.engine.variables:
+            self.log(f"  {name} = {self.engine.sources[name]}")
+
+    def _cmd_save(self, args):
+        if not args:
+            self.log("Usage: save <n>", TAG_ERROR)
+            return
+        try:
+            path = self._save(args)
+            self.log(f"Saved to '{path}'.", TAG_INFO)
+        except Exception as e:
+            self.log(f"Save failed: {e}", TAG_ERROR)
+
+    def _cmd_load(self, args):
+        if not args:
+            self.log("Usage: load <n>", TAG_ERROR)
+            return
+        try:
+            path = self._load(args)
+            count = len(self.engine.variables)
+            self.log(f"Loaded {count} variable(s) from '{path}'.", TAG_INFO)
+        except Exception as e:
+            self.log(f"Load failed: {e}", TAG_ERROR)
+
+    def _cmd_engine(self, source):
+        # Fallback handler: source had no recognized command word, so feed
+        # the whole line to the logic engine.
+        try:
+            result = self.engine.evaluate(source)
+            kind = result[0]
+            if kind == "value":
+                self.log(f"Output: {int(result[1])}", TAG_OUTPUT)
+            elif kind == "assignment":
+                _, name, value = result
+                if value is None:
+                    self.log(f"Pending: {name} := {self.engine.sources[name]}",
+                             TAG_PENDING)
+                else:
+                    self.log(f"Assigned: {name}", TAG_ASSIGN)
+        except SyntaxError as e:
+            self.log(f"Syntax error: {e}", TAG_ERROR)
+        except NameError as e:
+            self.log(f"Undefined: {e}", TAG_ERROR)
+        except RuntimeError as e:
+            self.log(f"Error: {e}", TAG_ERROR)
 
     # == COMMAND DISPATCH ==
+    def _commands(self):
+        """Map of command-word -> handler. Adding a new command means
+        writing one method and adding one row here."""
+        return {
+            "quit":  self._cmd_quit,
+            "exit":  self._cmd_quit,
+            "clear": self._cmd_clear,
+            "help":  self._cmd_help,
+            "var":   self._cmd_var,
+            "set":   self._do_set,
+            "show":  self._do_show,
+            "copy":  self._do_copy,
+            "save":  self._cmd_save,
+            "load":  self._cmd_load,
+        }
+
     def handle_command(self, cmd):
         cmd = cmd.strip()
         if not cmd:
             return
 
         self.history.append(cmd)
-        self.log(f"> {cmd}")
+        self.log(f"> {cmd}", TAG_PROMPT)
 
-        inst = cmd.casefold()
-        if inst in ("quit", "exit"):
-            self.running = False
-        elif inst == "clear":
-            self.workspace_lines = []
-            self._welcome()
-        elif inst == "help":
-            self.log("Help Menu:")
-            self.log("  help commands    - Lists all available commands.")
-            self.log("  help operators   - Lists all available operators.")
-            self.log("  help parameters  - Lists all available parameters.")
-            self.log("  help parantheses - Displays information about parantheses.")
-            self.log("  help batch       - Explains the 'set' and 'show' commands.")
-            self.log("  help keys        - Lists keyboard shortcuts.")
-        elif inst == "help commands":
-            self.log("Commands:")
-            self.log("  help   - Displays the help menu.")
-            self.log("  clear  - Clears the workspace.")
-            self.log("  exit   - Terminates the workspace.")
-            self.log("  var    - Lists all variables.")
-            self.log("  set?   - Batch-assigns a 16-bit register. See 'help batch'.")
-            self.log("  show?  - Displays a 16-bit register. See 'help batch'.")
-            self.log("  save X - Saves variables to 'saves/X.txt'.")
-            self.log("  load X - Loads variables from 'saves/X.txt'.")
-            self.log("  copy N - Copies the last N workspace lines to the clipboard.")
-            self.log("You can use commands anytime.")
-        elif inst == "help operators":
-            self.log("Operators:")
-            self.log("  OR     - Used for an OR gate.")
-            self.log("  AND    - Used for an AND gate.")
-            self.log("  XOR    - Used for an XOR gate.")
-            self.log("  IMPLY  - Used for an IMPLY gate.")
-            self.log("  NOR    - Used for a NOT OR gate.")
-            self.log("  NAND   - Used for a NOT AND gate.")
-            self.log("  XNOR   - Used for a NOT XOR gate.")
-            self.log("  NIMPLY - Used for a NOT IMPLY gate.")
-            self.log("A value is expected before and after an operator, with spaces in between.")
-        elif inst == "help parameters":
-            self.log("Parameters:")
-            self.log("  *      - Inverts a variable. Used for NOT.")
-            self.log("  =      - Assigns a variable to a value.")
-            self.log("Parameters can only be used after a variable.")
-            self.log("Entering a value performs calculation and outputs the result.")
-        elif inst in ("help parantheses", "help paranthesis"):
-            self.log("Parentheses:")
-            self.log("  (      - Opening Parenthesis")
-            self.log("  )      - Closing Parenthesis")
-            self.log("Parantheses are used to specify operation precedence.")
-            self.log("Parantheses must include a value inside them.")
-            self.log("A paranthesis is opened with '(' and closed with ')'.")
-            self.log("A closed paranthesis is expected in every procedure.")
-        elif inst == "help batch":
-            self.log("Batch Commands:")
-            self.log("  set <n> = <bits>")
-            self.log("    Assigns <n>0..<n>15 from a binary string.")
-            self.log("    Leftmost digit is the highest bit; upper bits pad with 0.")
-            self.log("    Value must be 1-16 digits of only 0 and 1 (spaces allowed).")
-            self.log("    Existing bits are overwritten.")
-            self.log("  show <n>")
-            self.log("    Displays <n>0..<n>15 as binary, decimal, and hex.")
-            self.log("    Unassigned or unresolvable bits show as '?'.")
-        elif inst == "help keys":
-            self.log("Keyboard:")
-            self.log("  Left / Right       - Move cursor within the input line.")
-            self.log("  Ctrl+(Left/Right)  - Jump cursor by word.")
-            self.log("  Home / End         - Jump cursor to start / end of input.")
-            self.log("  Backspace / Del    - Delete char before / at cursor.")
-            self.log("  Ctrl+Backspace     - Delete the previous word.")
-            self.log("  Up / Down          - Previous / next command from history.")
-            self.log("  PageUp / PageDown  - Scroll the workspace.")
-            self.log("  Mouse wheel        - Scroll the workspace.")
-            self.log("To copy text, use the 'copy N' command (see 'help commands').")
-        elif inst == "var":
-            if not self.engine.variables:
-                self.log("  (no variables defined)")
-            else:
-                for name in self.engine.variables:
-                    self.log(f"  {name} = {self.engine.sources[name]}")
-        elif inst == "set" or inst.startswith("set "):
-            self._do_set(cmd[3:].strip())
-        elif inst == "show" or inst.startswith("show "):
-            self._do_show(cmd[4:].strip())
-        elif inst == "copy" or inst.startswith("copy "):
-            self._do_copy(cmd[4:].strip())
-        elif inst == "save" or inst.startswith("save "):
-            name = cmd[4:].strip()
-            if not name:
-                self.log("Usage: save <n>")
-            else:
-                try:
-                    path = self._save(name)
-                    self.log(f"Saved to '{path}'.")
-                except Exception as e:
-                    self.log(f"Save failed: {e}")
-        elif inst == "load" or inst.startswith("load "):
-            name = cmd[4:].strip()
-            if not name:
-                self.log("Usage: load <n>")
-            else:
-                try:
-                    path = self._load(name)
-                    count = len(self.engine.variables)
-                    self.log(f"Loaded {count} variable(s) from '{path}'.")
-                except Exception as e:
-                    self.log(f"Load failed: {e}")
+        # Split on the first whitespace run. The first token (case-folded)
+        # is matched against the command table; anything else is engine input.
+        parts = cmd.split(None, 1)
+        word = parts[0].casefold()
+        args = parts[1].strip() if len(parts) > 1 else ""
+
+        handler = self._commands().get(word)
+        if handler is not None:
+            handler(args)
         else:
-            try:
-                result = self.engine.evaluate(cmd)
-                kind = result[0]
-                if kind == "value":
-                    self.log(f"Output: {int(result[1])}")
-                elif kind == "assignment":
-                    _, name, value = result
-                    if value is None:
-                        self.log(f"Pending: {name} := {self.engine.sources[name]}")
-                    else:
-                        self.log(f"Assigned: {name}")
-            except SyntaxError as e:
-                self.log(f"Syntax error: {e}")
-            except NameError as e:
-                self.log(f"Undefined: {e}")
-            except RuntimeError as e:
-                self.log(f"Error: {e}")
+            self._cmd_engine(cmd)
 
     # == MAIN LOOP ==
     def run(self):
