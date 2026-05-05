@@ -23,11 +23,11 @@ year, which isn't reasonable for a small open-source project). All major
 operating systems will show a warning the first time you run an unsigned app.
 This is normal and not specific to LogiBox.
 
-**Windows.** SmartScreen may say "Windows protected your PC". Click
+**Windows:** SmartScreen may say "Windows protected your PC". Click
 **More info**, then **Run anyway**. Windows remembers your choice for
 future launches.
 
-**macOS.** Gatekeeper may say "Cannot be opened because the developer cannot
+**macOS:** Gatekeeper may say "Cannot be opened because the developer cannot
 be verified" or "macOS cannot verify that this app is free from malware".
 Right-click (or Control-click) `LogiBox` in Finder and choose **Open**, the
 warning then offers an Open button that plain double-click does not. If that
@@ -35,7 +35,7 @@ still refuses, go to **System Settings → Privacy & Security**, scroll down,
 and click **Open Anyway** next to the LogiBox entry. Once allowed, future
 launches work normally.
 
-**Linux.** No security prompt by default. If the file refuses to run,
+**Linux:** No security prompt by default. If the file refuses to run,
 you may need to mark it executable first:
 
     chmod +x LogiBox
